@@ -301,6 +301,11 @@ static struct platform_device bcm2708_mci_device = {
 };
 #endif /* CONFIG_MMC_BCM2708 */
 
+static struct platform_device bcm2708_ili9325 = {
+	.name = "ili9325",
+	.id = 0,
+};
+
 #if defined(CONFIG_W1_MASTER_GPIO) || defined(CONFIG_W1_MASTER_GPIO_MODULE)
 static struct w1_gpio_platform_data w1_gpio_pdata = {
 	.pin = W1_GPIO,
@@ -725,6 +730,7 @@ void __init bcm2708_init(void)
 #ifdef CONFIG_MMC_BCM2708
 	bcm_register_device(&bcm2708_mci_device);
 #endif
+	bcm_register_device(&bcm2708_ili9325);
 	bcm_register_device(&bcm2708_fb_device);
 	if (!fiq_fix_enable)
 	{
