@@ -742,8 +742,8 @@ int32_t dwc_otg_hcd_handle_sof_intr(dwc_otg_hcd_t * hcd)
 	}
 
 	/* Clear interrupt */
-	//gintsts.b.sofintr = 1;
-	//DWC_WRITE_REG32(&hcd->core_if->core_global_regs->gintsts, gintsts.d32);
+	gintsts.b.sofintr = 1;
+	DWC_WRITE_REG32(&hcd->core_if->core_global_regs->gintsts, gintsts.d32);
 
 	return 1;
 }
@@ -1328,9 +1328,19 @@ static void release_channel(dwc_otg_hcd_t * hcd,
 #ifdef FIQ_DEBUG
 	int endp = qtd->urb ? qtd->urb->pipe_info.ep_num : 0;
 #endif
+	int hog_port = 0;
 
 	DWC_DEBUGPL(DBG_HCDV, "  %s: channel %d, halt_status %d, xfer_len %d\n",
 		    __func__, hc->hc_num, halt_status, hc->xfer_len);
+
+	if(fiq_split_enable && hc->do_split) {
+		if(!hc->ep_is_in && hc->ep_type == UE_ISOCHRONOUS) {
+			if(hc->xact_pos == DWC_HCSPLIT_XACTPOS_MID || 
+					hc->xact_pos == DWC_HCSPLIT_XACTPOS_BEGIN) {
+				hog_port = 1;
+			}
+		}
+	}
 
 	switch (halt_status) {
 	case DWC_OTG_HC_XFER_URB_COMPLETE:
@@ -1417,12 +1427,14 @@ cleanup:
 			fiq_print(FIQDBG_ERR, "PRTNOTAL");
 			//BUG();
 		}
-
-		hcd->hub_port[hc->hub_addr] &= ~(1 << hc->port_addr);
+		if(!hog_port && (hc->ep_type == DWC_OTG_EP_TYPE_ISOC ||
+				hc->ep_type == DWC_OTG_EP_TYPE_INTR)) {
+			hcd->hub_port[hc->hub_addr] &= ~(1 << hc->port_addr);
 #ifdef FIQ_DEBUG
-		hcd->hub_port_alloc[hc->hub_addr * 16 + hc->port_addr] = -1;
+			hcd->hub_port_alloc[hc->hub_addr * 16 + hc->port_addr] = -1;
 #endif
-		fiq_print(FIQDBG_PORTHUB, "H%dP%d:RR%d", hc->hub_addr, hc->port_addr, endp);
+			fiq_print(FIQDBG_PORTHUB, "H%dP%d:RR%d", hc->hub_addr, hc->port_addr, endp);
+		}
 	}
 
 	/* Try to queue more transfers now that there's a free channel. */
@@ -1845,8 +1857,7 @@ static int32_t handle_hc_nak_intr(dwc_otg_hcd_t * hcd,
 	 */
 	switch(dwc_otg_hcd_get_pipe_type(&qtd->urb->pipe_info)) {
 		case UE_BULK:
-		//case UE_INTERRUPT:
-		//case UE_CONTROL:
+		case UE_CONTROL:
 		if (nak_holdoff_enable)
 			hc->qh->nak_frame = dwc_otg_hcd_get_frame_number(hcd);
 	}
@@ -2578,12 +2589,24 @@ static void handle_hc_chhltd_intr_dma(dwc_otg_hcd_t * hcd,
 				     DWC_READ_REG32(&hcd->
 						    core_if->core_global_regs->
 						    gintsts));
+				/* Failthrough: use 3-strikes rule */
+				qtd->error_count++;
+				dwc_otg_hcd_save_data_toggle(hc, hc_regs, qtd);
+				update_urb_state_xfer_intr(hc, hc_regs,
+					   qtd->urb, qtd, DWC_OTG_HC_XFER_XACT_ERR);
+				halt_channel(hcd, hc, qtd, DWC_OTG_HC_XFER_XACT_ERR);
 			}
 
 		}
 	} else {
 		DWC_PRINTF("NYET/NAK/ACK/other in non-error case, 0x%08x\n",
 			   hcint.d32);
+		/* Failthrough: use 3-strikes rule */
+		qtd->error_count++;
+		dwc_otg_hcd_save_data_toggle(hc, hc_regs, qtd);
+		update_urb_state_xfer_intr(hc, hc_regs,
+			   qtd->urb, qtd, DWC_OTG_HC_XFER_XACT_ERR);
+		halt_channel(hcd, hc, qtd, DWC_OTG_HC_XFER_XACT_ERR);
 	}
 }
 
@@ -2636,6 +2659,13 @@ int32_t dwc_otg_hcd_handle_hc_n_intr(dwc_otg_hcd_t * dwc_otg_hcd, uint32_t num)
 
 	hc = dwc_otg_hcd->hc_ptr_array[num];
 	hc_regs = dwc_otg_hcd->core_if->host_if->hc_regs[num];
+	if(hc->halt_status == DWC_OTG_HC_XFER_URB_DEQUEUE) {
+		/* We are responding to a channel disable. Driver
+		 * state is cleared - our qtd has gone away.
+		 */
+		release_channel(dwc_otg_hcd, hc, NULL, hc->halt_status);
+		return 1;
+	}
 	qtd = DWC_CIRCLEQ_FIRST(&hc->qh->qtd_list);
 
 	hcint.d32 = DWC_READ_REG32(&hc_regs->hcint);

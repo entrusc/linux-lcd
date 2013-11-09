@@ -59,6 +59,11 @@ static int last_sel_trans_num_avail_hc_at_end = 0;
 
 extern int g_next_sched_frame, g_np_count, g_np_sent;
 
+extern haint_data_t haint_saved;
+extern hcintmsk_data_t hcintmsk_saved[MAX_EPS_CHANNELS];
+extern hcint_data_t hcint_saved[MAX_EPS_CHANNELS];
+extern gintsts_data_t ginsts_saved;
+
 dwc_otg_hcd_t *dwc_otg_hcd_alloc_hcd(void)
 {
 	return DWC_ALLOC(sizeof(dwc_otg_hcd_t));
@@ -168,31 +173,43 @@ static void del_timers(dwc_otg_hcd_t * hcd)
 
 /**
  * Processes all the URBs in a single list of QHs. Completes them with
- * -ETIMEDOUT and frees the QTD.
+ * -ESHUTDOWN and frees the QTD.
  */
 static void kill_urbs_in_qh_list(dwc_otg_hcd_t * hcd, dwc_list_link_t * qh_list)
 {
-	dwc_list_link_t *qh_item;
+	dwc_list_link_t *qh_item, *qh_tmp;
 	dwc_otg_qh_t *qh;
 	dwc_otg_qtd_t *qtd, *qtd_tmp;
 
-	DWC_LIST_FOREACH(qh_item, qh_list) {
+	DWC_LIST_FOREACH_SAFE(qh_item, qh_tmp, qh_list) {
 		qh = DWC_LIST_ENTRY(qh_item, dwc_otg_qh_t, qh_list_entry);
 		DWC_CIRCLEQ_FOREACH_SAFE(qtd, qtd_tmp,
 					 &qh->qtd_list, qtd_list_entry) {
 			qtd = DWC_CIRCLEQ_FIRST(&qh->qtd_list);
 			if (qtd->urb != NULL) {
 				hcd->fops->complete(hcd, qtd->urb->priv,
-						    qtd->urb, -DWC_E_TIMEOUT);
+						    qtd->urb, -DWC_E_SHUTDOWN);
 				dwc_otg_hcd_qtd_remove_and_free(hcd, qtd, qh);
 			}
 
 		}
+		if(qh->channel) {
+			/* Using hcchar.chen == 1 is not a reliable test.
+			 * It is possible that the channel has already halted
+			 * but not yet been through the IRQ handler.
+			 */
+			dwc_otg_hc_halt(hcd->core_if, qh->channel,
+				DWC_OTG_HC_XFER_URB_DEQUEUE);
+			if(microframe_schedule)
+				hcd->available_host_channels++;
+			qh->channel = NULL;
+		}
+		dwc_otg_hcd_qh_remove(hcd, qh);
 	}
 }
 
 /**
- * Responds with an error status of ETIMEDOUT to all URBs in the non-periodic
+ * Responds with an error status of ESHUTDOWN to all URBs in the non-periodic
  * and periodic schedules. The QTD associated with each URB is removed from
  * the schedule and freed. This function may be called when a disconnect is
  * detected or when the HCD is being stopped.
@@ -278,7 +295,8 @@ static int32_t dwc_otg_hcd_disconnect_cb(void *p)
 	 */
 	dwc_otg_hcd->flags.b.port_connect_status_change = 1;
 	dwc_otg_hcd->flags.b.port_connect_status = 0;
-
+	if(fiq_fix_enable)
+		local_fiq_disable();
 	/*
 	 * Shutdown any transfers in process by clearing the Tx FIFO Empty
 	 * interrupt mask and status bits and disabling subsequent host
@@ -374,7 +392,21 @@ static int32_t dwc_otg_hcd_disconnect_cb(void *p)
 				channel->qh = NULL;
 			}
 		}
+		if(fiq_split_enable) {
+			for(i=0; i < 128; i++) {
+				dwc_otg_hcd->hub_port[i] = 0;
+			}
+			haint_saved.d32 = 0;
+			for(i=0; i < MAX_EPS_CHANNELS; i++) {
+				hcint_saved[i].d32 = 0;
+				hcintmsk_saved[i].d32 = 0;
+			}
+		}
+
 	}
+
+	if(fiq_fix_enable)
+		local_fiq_enable();
 
 	if (dwc_otg_hcd->fops->disconnect) {
 		dwc_otg_hcd->fops->disconnect(dwc_otg_hcd);
@@ -469,6 +501,7 @@ int dwc_otg_hcd_urb_enqueue(dwc_otg_hcd_t * hcd,
 	dwc_otg_transaction_type_e tr_type;
 	dwc_otg_qtd_t *qtd;
 	gintmsk_data_t intr_mask = {.d32 = 0 };
+	hprt0_data_t hprt0 = { .d32 = 0 };
 
 #ifdef DEBUG /* integrity checks (Broadcom) */
 	if (NULL == hcd->core_if) {
@@ -481,6 +514,16 @@ int dwc_otg_hcd_urb_enqueue(dwc_otg_hcd_t * hcd,
 		/* No longer connected. */
 		DWC_ERROR("Not connected\n");
 		return -DWC_E_NO_DEVICE;
+	}
+
+	/* Some core configurations cannot support LS traffic on a FS root port */
+	if ((hcd->fops->speed(hcd, dwc_otg_urb->priv) == USB_SPEED_LOW) &&
+		(hcd->core_if->hwcfg2.b.fs_phy_type == 1) &&
+		(hcd->core_if->hwcfg2.b.hs_phy_type == 1)) {
+			hprt0.d32 = DWC_READ_REG32(hcd->core_if->host_if->hprt0);
+			if (hprt0.b.prtspd == DWC_HPRT0_PRTSPD_FULL_SPEED) {
+				return -DWC_E_NO_DEVICE;
+			}
 	}
 
 	qtd = dwc_otg_hcd_qtd_create(dwc_otg_urb, atomic_alloc);
@@ -1356,6 +1399,7 @@ dwc_otg_transaction_type_e dwc_otg_hcd_select_transactions(dwc_otg_hcd_t * hcd)
 {
 	dwc_list_link_t *qh_ptr;
 	dwc_otg_qh_t *qh;
+	dwc_otg_qtd_t *qtd;
 	int num_channels;
 	dwc_irqflags_t flags;
 	dwc_spinlock_t *channel_lock = hcd->channel_lock;
@@ -1379,11 +1423,18 @@ dwc_otg_transaction_type_e dwc_otg_hcd_select_transactions(dwc_otg_hcd_t * hcd)
 
 		qh = DWC_LIST_ENTRY(qh_ptr, dwc_otg_qh_t, qh_list_entry);
 
-		if(qh->do_split && dwc_otg_hcd_allocate_port(hcd, qh))
-		{
-			qh_ptr = DWC_LIST_NEXT(qh_ptr);
-			g_next_sched_frame = dwc_frame_num_inc(dwc_otg_hcd_get_frame_number(hcd), 1);
-			continue;
+		if(qh->do_split) {
+			qtd = DWC_CIRCLEQ_FIRST(&qh->qtd_list);
+			if(!(qh->ep_type == UE_ISOCHRONOUS &&
+					(qtd->isoc_split_pos == DWC_HCSPLIT_XACTPOS_MID ||
+					qtd->isoc_split_pos == DWC_HCSPLIT_XACTPOS_END))) {
+				if(dwc_otg_hcd_allocate_port(hcd, qh))
+				{
+					qh_ptr = DWC_LIST_NEXT(qh_ptr);
+					g_next_sched_frame = dwc_frame_num_inc(dwc_otg_hcd_get_frame_number(hcd), 1);
+					continue;
+				}
+			}
 		}
 
 		if (microframe_schedule) {
@@ -1451,18 +1502,10 @@ dwc_otg_transaction_type_e dwc_otg_hcd_select_transactions(dwc_otg_hcd_t * hcd)
 			}
 		}
 
-		if (qh->do_split && dwc_otg_hcd_allocate_port(hcd, qh))
-		{
-			g_next_sched_frame = dwc_frame_num_inc(dwc_otg_hcd_get_frame_number(hcd), 1);
-			qh_ptr = DWC_LIST_NEXT(qh_ptr);
-			continue;
-		}
-
 		if (microframe_schedule) {
 				DWC_SPINLOCK_IRQSAVE(channel_lock, &flags);
 				if (hcd->available_host_channels < 1) {
 					DWC_SPINUNLOCK_IRQRESTORE(channel_lock, flags);
-					if(qh->do_split) dwc_otg_hcd_release_port(hcd, qh);
 					break;
 				}
 				hcd->available_host_channels--;

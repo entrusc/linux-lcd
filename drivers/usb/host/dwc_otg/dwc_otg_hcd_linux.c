@@ -309,6 +309,9 @@ static int _complete(dwc_otg_hcd_t * hcd, void *urb_handle,
 	case -DWC_E_OVERFLOW:
 		status = -EOVERFLOW;
 		break;
+	case -DWC_E_SHUTDOWN:
+		status = -ESHUTDOWN;
+		break;
 	default:
 		if (status) {
 			DWC_PRINTF("Uknown urb status %d\n", status);
@@ -781,8 +784,7 @@ static int dwc_otg_urb_enqueue(struct usb_hcd *hcd,
 	{
 		retval = dwc_otg_hcd_urb_enqueue(dwc_otg_hcd, dwc_otg_urb,
 						/*(dwc_otg_qh_t **)*/
-						ref_ep_hcpriv,
-						mem_flags == GFP_ATOMIC ? 1 : 0);
+						ref_ep_hcpriv, 1);
 		if (0 == retval) {
 			if (alloc_bandwidth) {
 				allocate_bus_bandwidth(hcd,
@@ -795,11 +797,19 @@ static int dwc_otg_urb_enqueue(struct usb_hcd *hcd,
 #if USB_URB_EP_LINKING
 			usb_hcd_unlink_urb_from_ep(hcd, urb);
 #endif
+			DWC_FREE(dwc_otg_urb);
 			urb->hcpriv = NULL;
 			if (retval == -DWC_E_NO_DEVICE)
 				retval = -ENODEV;
 		}
 	}
+#if USB_URB_EP_LINKING
+	else
+	{
+		DWC_FREE(dwc_otg_urb);
+		urb->hcpriv = NULL;
+	}
+#endif
 	DWC_SPINUNLOCK_IRQRESTORE(dwc_otg_hcd->lock, irqflags);
 	return retval;
 }
